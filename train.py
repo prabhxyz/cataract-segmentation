@@ -54,8 +54,10 @@ def evaluate(model, loader, device):
         gts   = masks.cpu().numpy()
 
         for b in range(preds.shape[0]):
+            # IoU & Dice
             ious, miou = compute_iou(preds[b], gts[b], num_classes=3, ignore_label=255)
             dices, mdice = compute_dice(preds[b], gts[b], num_classes=3, ignore_label=255)
+            # Precision/Recall/F1
             prf = compute_precision_recall_f1(preds[b], gts[b], num_classes=3, ignore_label=255)
 
             all_ious.append(ious)
@@ -67,7 +69,7 @@ def evaluate(model, loader, device):
     avg_loss = total_loss / len(loader.dataset)
 
     import numpy as np
-    ious_arr   = np.array(all_ious)  # shape [N,3]
+    ious_arr   = np.array(all_ious)   # shape [N,3]
     dices_arr  = np.array(all_dices)
     precs_arr  = np.array(all_precs)
     recs_arr   = np.array(all_recs)
@@ -82,7 +84,6 @@ def evaluate(model, loader, device):
     mean_rec_class  = recs_arr.mean(axis=0).tolist()
     mean_f1_class   = f1s_arr.mean(axis=0).tolist()
 
-    # macro average of each image's average
     mean_prec = float(np.mean(precs_arr.mean(axis=1)))
     mean_rec  = float(np.mean(recs_arr.mean(axis=1)))
     mean_f1   = float(np.mean(f1s_arr.mean(axis=1)))
@@ -104,14 +105,13 @@ def evaluate(model, loader, device):
     }
     return metrics
 
-
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1) Build train/val/test lists
+    # 1) Data splits
     train_list, val_list, test_list = make_train_val_test_lists()
 
-    # 2) Build datasets
+    # 2) Datasets
     train_dataset = SuperviselyDataset(train_list)
     val_dataset   = SuperviselyDataset(val_list)
     test_dataset  = SuperviselyDataset(test_list)
@@ -124,7 +124,7 @@ def main():
     # 4) Model
     model = SwinUNet(num_classes=3).to(device)
 
-    # 5) Optimizer
+    # 5) Optimizer & scheduler
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
@@ -134,7 +134,9 @@ def main():
     os.makedirs("checkpoints", exist_ok=True)
 
     for epoch in range(1, EPOCHS+1):
+        # Train
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
+        # Evaluate
         val_metrics = evaluate(model, val_loader, device)
         val_loss = val_metrics["loss"]
         val_f1   = val_metrics["mean_f1"]
@@ -150,12 +152,21 @@ def main():
               f"val_mIoU={val_iou:.4f} "
               f"val_mDice={val_dice:.4f}")
 
-        # Save best checkpoint by mean F1
+        # ------------------------------
+        # SAVE A CHECKPOINT EVERY EPOCH
+        # ------------------------------
+        # This ensures we keep a partial model even if we kill training early.
+        epoch_ckpt_path = f"checkpoints/model_epoch_{epoch}.pth"
+        torch.save(model.state_dict(), epoch_ckpt_path)
+        print(f"Saved epoch checkpoint to: {epoch_ckpt_path}")
+
+        # Optionally also save best if improved
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             torch.save(model.state_dict(), "checkpoints/best_model.pth")
+            print("Updated best_model.pth (based on val_mF1)")
 
-    # 7) Test
+    # 7) Evaluate on test set
     model.load_state_dict(torch.load("checkpoints/best_model.pth", map_location=device))
     test_metrics = evaluate(model, test_loader, device)
     print("Test metrics:", test_metrics)
