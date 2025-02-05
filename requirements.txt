@@ -1,7 +1,11 @@
+# To install the CUDA-enabled versions of PyTorch, torchvision, and torchaudio for CUDA 11.8, run:
+# pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --extra-index-url https://download.pytorch.org/whl/cu118
+
 torch==2.0.1
 torchvision==0.15.2
-timm==0.9.2
-opencv-python==4.8.0.76
-numpy==1.24.3
-matplotlib==3.7.1
-tqdm==4.65.0
+torchaudio==2.0.2
+segmentation-models-pytorch
+albumentations
+opencv-python
+timm
+numpy<2

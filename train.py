@@ -1,179 +1,243 @@
 import os
+import glob
 import random
+import argparse
+import json
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import torch.backends.cudnn as cudnn
 
-from supervisely_dataset import make_train_val_test_lists, SuperviselyDataset
-from swin_unet import SwinUNet
-from metrics import compute_iou, compute_dice, compute_precision_recall_f1
-from plot_utils import save_results_to_json, plot_segmentation_metrics
+from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
+import torch.distributed as dist
+from torch.cuda.amp import autocast, GradScaler
 
-def train_one_epoch(model, loader, optimizer, device):
-    model.train()
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
-    total_loss= 0.0
-    for images, masks in tqdm(loader, desc="Training", ncols=100):
-        images = images.to(device, dtype=torch.float32)
-        masks  = masks.to(device, dtype=torch.long)
+from cataract_dataset import CataractDataset
+from augmentations import get_training_augmentations, get_validation_augmentations
+from models import get_segmentation_model, CombinedLoss, calculate_iou, calculate_dice
 
-        optimizer.zero_grad()
-        logits = model(images)  # => [B,3,H,W]
-        loss = criterion(logits, masks)
-        loss.backward()
-        optimizer.step()
 
-        total_loss += loss.item() * images.size(0)
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, required=True,
+                        help='Path to the Cataract-1k dataset root.')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU.')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate.')
+    parser.add_argument('--encoder_name', type=str, default='timm-efficientnet-b4',
+                        help='Encoder name for segmentation model.')
+    parser.add_argument('--encoder_weights', type=str, default='imagenet',
+                        help='Encoder weights to use.')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of DataLoader workers.')
+    parser.add_argument('--use_ddp', action='store_true', help='Use DistributedDataParallel.')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for DDP.')
+    return parser.parse_args()
 
-    avg_loss = total_loss / len(loader.dataset)
-    return avg_loss
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
-    total_loss = 0.0
+def find_samples(data_dir):
+    """
+    Traverse the dataset directories to pair each image with its JSON annotation.
+    Returns a list of tuples: (img_path, ann_path).
+    """
+    ann_base = os.path.join(data_dir, "Annotations", "Images-and-Supervisely-Annotations")
+    all_cases = sorted(os.listdir(ann_base))
 
-    all_ious  = []
-    all_dices = []
-    all_precs = []
-    all_recs  = []
-    all_f1s   = []
+    samples = []
+    for case in all_cases:
+        img_dir = os.path.join(ann_base, case, "img")
+        ann_dir = os.path.join(ann_base, case, "ann")
+        if not os.path.exists(img_dir) or not os.path.exists(ann_dir):
+            continue
 
-    for images, masks in tqdm(loader, desc="Evaluating", ncols=100):
-        images = images.to(device, dtype=torch.float32)
-        masks  = masks.to(device, dtype=torch.long)
+        png_files = glob.glob(os.path.join(img_dir, "*.png"))
+        for img_path in png_files:
+            filename = os.path.basename(img_path)  # e.g. case0001_01.png
+            ann_path = os.path.join(ann_dir, filename + ".json")  # e.g. case0001_01.png.json
+            if os.path.exists(ann_path):
+                samples.append((img_path, ann_path))
 
-        logits = model(images)
-        loss = criterion(logits, masks)
-        total_loss += loss.item() * images.size(0)
+    return samples
 
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-        gts   = masks.cpu().numpy()
 
-        for b in range(preds.shape[0]):
-            # IoU & Dice
-            ious, miou = compute_iou(preds[b], gts[b], num_classes=3, ignore_label=255)
-            dices, mdice = compute_dice(preds[b], gts[b], num_classes=3, ignore_label=255)
-            # Precision/Recall/F1
-            prf = compute_precision_recall_f1(preds[b], gts[b], num_classes=3, ignore_label=255)
+def split_dataset(samples, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+    """
+    Split the samples into train/val/test sets.
+    """
+    random.shuffle(samples)
+    n_total = len(samples)
+    n_train = int(n_total * train_ratio)
+    n_val = int(n_total * val_ratio)
+    train_samples = samples[:n_train]
+    val_samples = samples[n_train:n_train + n_val]
+    test_samples = samples[n_train + n_val:]
+    return train_samples, val_samples, test_samples
 
-            all_ious.append(ious)
-            all_dices.append(dices)
-            all_precs.append(prf["per_class_precision"])
-            all_recs.append(prf["per_class_recall"])
-            all_f1s.append(prf["per_class_f1"])
-
-    avg_loss = total_loss / len(loader.dataset)
-
-    import numpy as np
-    ious_arr   = np.array(all_ious)   # shape [N,3]
-    dices_arr  = np.array(all_dices)
-    precs_arr  = np.array(all_precs)
-    recs_arr   = np.array(all_recs)
-    f1s_arr    = np.array(all_f1s)
-
-    iou_per_class   = ious_arr.mean(axis=0).tolist()
-    dice_per_class  = dices_arr.mean(axis=0).tolist()
-    mean_iou        = float(np.mean(ious_arr.mean(axis=1)))
-    mean_dice       = float(np.mean(dices_arr.mean(axis=1)))
-
-    mean_prec_class = precs_arr.mean(axis=0).tolist()
-    mean_rec_class  = recs_arr.mean(axis=0).tolist()
-    mean_f1_class   = f1s_arr.mean(axis=0).tolist()
-
-    mean_prec = float(np.mean(precs_arr.mean(axis=1)))
-    mean_rec  = float(np.mean(recs_arr.mean(axis=1)))
-    mean_f1   = float(np.mean(f1s_arr.mean(axis=1)))
-
-    metrics = {
-        "loss": avg_loss,
-        "iou_per_class": iou_per_class,
-        "mean_iou": mean_iou,
-        "dice_per_class": dice_per_class,
-        "mean_dice": mean_dice,
-
-        "precision_per_class": mean_prec_class,
-        "recall_per_class": mean_rec_class,
-        "f1_per_class": mean_f1_class,
-
-        "mean_precision": mean_prec,
-        "mean_recall": mean_rec,
-        "mean_f1": mean_f1
-    }
-    return metrics
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = parse_args()
+    if args.use_ddp:
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(args.local_rank)
 
-    # 1) Data splits
-    train_list, val_list, test_list = make_train_val_test_lists()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cudnn.benchmark = True
 
-    # 2) Datasets
-    train_dataset = SuperviselyDataset(train_list)
-    val_dataset   = SuperviselyDataset(val_list)
-    test_dataset  = SuperviselyDataset(test_list)
+    # 1) Load all samples (img_path, ann_path)
+    samples = find_samples(args.data_dir)
+    train_samples, val_samples, test_samples = split_dataset(samples)
 
-    # 3) DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True,  num_workers=4, drop_last=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=2, shuffle=False, num_workers=4)
-    test_loader  = DataLoader(test_dataset,  batch_size=2, shuffle=False, num_workers=4)
+    # 2) Create dataset objects
+    train_dataset = CataractDataset(
+        train_samples,
+        transform=get_training_augmentations()
+    )
+    val_dataset = CataractDataset(
+        val_samples,
+        transform=get_validation_augmentations()
+    )
 
-    # 4) Model
-    model = SwinUNet(num_classes=3).to(device)
+    # 3) Create data loaders
+    if args.use_ddp:
+        train_sampler = DistributedSampler(train_dataset)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    else:
+        train_sampler = RandomSampler(train_dataset)
+        val_sampler = None
 
-    # 5) Optimizer & scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
 
-    # 6) Training
-    EPOCHS = 10
-    best_val_f1 = 0.0
-    os.makedirs("checkpoints", exist_ok=True)
+    # 4) Build the model
+    model = get_segmentation_model(
+        num_classes=3,
+        encoder_name=args.encoder_name,
+        encoder_weights=args.encoder_weights
+    )
 
-    for epoch in range(1, EPOCHS+1):
-        # Train
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        # Evaluate
-        val_metrics = evaluate(model, val_loader, device)
-        val_loss = val_metrics["loss"]
-        val_f1   = val_metrics["mean_f1"]
-        val_iou  = val_metrics["mean_iou"]
-        val_dice = val_metrics["mean_dice"]
+    if args.use_ddp:
+        model = model.to(device)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank
+        )
+    else:
+        model = torch.nn.DataParallel(model)
+        model = model.to(device)
 
-        scheduler.step()
+    # 5) Define loss, optimizer, scheduler
+    criterion = CombinedLoss(dice_weight=0.5, focal_weight=0.5)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1)
 
-        print(f"\n[Epoch {epoch}/{EPOCHS}] "
-              f"train_loss={train_loss:.4f} "
-              f"val_loss={val_loss:.4f} "
-              f"val_mF1={val_f1:.4f} "
-              f"val_mIoU={val_iou:.4f} "
-              f"val_mDice={val_dice:.4f}")
+    # For mixed precision
+    scaler = GradScaler()
 
-        # ------------------------------
-        # SAVE A CHECKPOINT EVERY EPOCH
-        # ------------------------------
-        # This ensures we keep a partial model even if we kill training early.
-        epoch_ckpt_path = f"checkpoints/model_epoch_{epoch}.pth"
-        torch.save(model.state_dict(), epoch_ckpt_path)
-        print(f"Saved epoch checkpoint to: {epoch_ckpt_path}")
+    # 6) Training loop
+    best_val_iou = 0.0
+    for epoch in range(args.epochs):
+        if args.use_ddp:
+            train_sampler.set_epoch(epoch)
 
-        # Optionally also save best if improved
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            torch.save(model.state_dict(), "checkpoints/best_model.pth")
-            print("Updated best_model.pth (based on val_mF1)")
+        model.train()
+        running_loss = 0.0
+        running_iou = 0.0
+        running_dice = 0.0
+        step = 0
 
-    # 7) Evaluate on test set
-    model.load_state_dict(torch.load("checkpoints/best_model.pth", map_location=device))
-    test_metrics = evaluate(model, test_loader, device)
-    print("Test metrics:", test_metrics)
+        for images, masks in train_loader:
+            images, masks = images.to(device), masks.to(device)
 
-    # 8) Save & Plot
-    save_results_to_json(test_metrics, "evaluation_results.json")
-    plot_segmentation_metrics(test_metrics, "evaluation_metrics.png")
+            optimizer.zero_grad()
+
+            with autocast(enabled=True):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+
+            # Compute IoU and Dice (every 10 steps for speed)
+            if step % 10 == 0:
+                with torch.no_grad():
+                    preds = torch.sigmoid(outputs)
+                    iou_val = calculate_iou(preds, masks)
+                    dice_val = calculate_dice(preds, masks)
+                    running_iou += iou_val
+                    running_dice += dice_val
+            step += 1
+
+        # Update scheduler
+        scheduler.step(epoch)
+
+        epoch_loss = running_loss / step
+        epoch_iou = running_iou / (step / 10)
+        epoch_dice = running_dice / (step / 10)
+
+        # Reduce metrics across multiple processes if using DDP
+        if dist.is_initialized():
+            metrics_tensor = torch.tensor([epoch_loss, epoch_iou, epoch_dice], device=device)
+            dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+            metrics_tensor /= dist.get_world_size()
+            epoch_loss, epoch_iou, epoch_dice = metrics_tensor.tolist()
+
+        # Print metrics only on rank 0
+        if (not args.use_ddp) or (dist.get_rank() == 0):
+            print(f"[Epoch {epoch + 1}/{args.epochs}] loss={epoch_loss:.4f} IoU={epoch_iou:.4f} Dice={epoch_dice:.4f}")
+
+        # Validation (only rank 0 does evaluation + checkpointing)
+        if (not args.use_ddp) or (dist.get_rank() == 0):
+            model.eval()
+            val_iou, val_dice, val_steps = 0.0, 0.0, 0
+            with torch.no_grad():
+                for vimages, vmasks in val_loader:
+                    vimages, vmasks = vimages.to(device), vmasks.to(device)
+                    voutputs = model(vimages)
+                    vpreds = torch.sigmoid(voutputs)
+                    val_iou += calculate_iou(vpreds, vmasks)
+                    val_dice += calculate_dice(vpreds, vmasks)
+                    val_steps += 1
+            val_iou /= val_steps
+            val_dice /= val_steps
+
+            print(f"   Validation IoU={val_iou:.4f}, Dice={val_dice:.4f}")
+
+            # Save checkpoint **EVERY EPOCH** 
+            epoch_ckpt_path = f"model_epoch_{epoch + 1}.pth"
+            if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                torch.save(model.module.state_dict(), epoch_ckpt_path)
+            else:
+                torch.save(model.state_dict(), epoch_ckpt_path)
+            print(f"   Saved epoch checkpoint: {epoch_ckpt_path}")
+
+            # Also update best model if this is the highest val_iou
+            if val_iou > best_val_iou:
+                best_val_iou = val_iou
+                if isinstance(model, torch.nn.DataParallel) or isinstance(model,
+                                                                          torch.nn.parallel.DistributedDataParallel):
+                    torch.save(model.module.state_dict(), "best_model.pth")
+                else:
+                    torch.save(model.state_dict(), "best_model.pth")
+                print("   Updated best_model.pth")
+
+    # Optional test set evaluation (if you want) ...
+    if args.use_ddp:
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
