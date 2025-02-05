@@ -85,7 +85,6 @@ def main():
     samples = find_samples(args.data_dir)
     train_samples, val_samples, test_samples = split_dataset(samples)
 
-    # Use minimal transformations: only resize.
     train_dataset = CataractDataset(
         train_samples,
         transform=get_training_augmentations()
@@ -158,7 +157,7 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item()
-            if step % 10 == 0 and step > 0:
+            if step % 10 == 0:
                 with torch.no_grad():
                     preds = torch.sigmoid(outputs)
                     iou_val = calculate_iou(preds, masks)

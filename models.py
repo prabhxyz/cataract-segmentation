@@ -87,7 +87,8 @@ class CombinedLoss(nn.Module):
 def get_segmentation_model(num_classes=3, encoder_name='timm-efficientnet-b4', encoder_weights='imagenet'):
     """
     Returns a segmentation model.
-    We use Unet++ with the specified encoder.
+    The default is Unet++ with the specified encoder.
+    (You can experiment with alternatives, e.g., DeepLabV3Plus, without breaking inference.)
     """
     model = smp.UnetPlusPlus(
         encoder_name=encoder_name,
