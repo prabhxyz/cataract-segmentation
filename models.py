@@ -25,7 +25,7 @@ class WeightedDiceLoss(nn.Module):
 ###############################################
 def focal_loss_with_logits(y_pred, y_true, alpha=1.0, gamma=2.0, reduction='mean'):
     p = torch.sigmoid(y_pred)
-    bce = - (y_true * torch.log(p + 1e-7) + (1 - y_true) * torch.log(1 - p + 1e-7))
+    bce = -(y_true * torch.log(p + 1e-7) + (1 - y_true) * torch.log(1 - p + 1e-7))
     focal_factor = (1 - p) ** gamma
     loss = alpha * focal_factor * bce
     if reduction == 'mean':
@@ -41,36 +41,32 @@ def focal_loss_with_logits(y_pred, y_true, alpha=1.0, gamma=2.0, reduction='mean
 ###############################################
 class CombinedLoss(nn.Module):
     def __init__(self, dice_weight=0.5, focal_weight=0.5, weight=1.0):
-        """
-        dice_weight, focal_weight: how to balance the two terms
-        weight: alpha in focal + weighting in dice
-        """
         super().__init__()
         self.dice_weight = dice_weight
         self.focal_weight = focal_weight
         self.weight = weight
-        self.dice_loss = WeightedDiceLoss(weight=self.weight)
+        self.dice_loss_fn = WeightedDiceLoss(weight=self.weight)
 
     def forward(self, outputs, targets):
-        dice = self.dice_loss(outputs, targets)
-        focal = focal_loss_with_logits(outputs, targets, alpha=self.weight)
-        return self.dice_weight * dice + self.focal_weight * focal
+        dice_loss = self.dice_loss_fn(outputs, targets)
+        focal_loss = focal_loss_with_logits(outputs, targets, alpha=self.weight)
+        return self.dice_weight * dice_loss + self.focal_weight * focal_loss
 
 
 ###############################################
-# DeepLabV3 with ResNet101 (Binary)
+# PSPNet with ResNet101 (Binary)
 ###############################################
 def get_segmentation_model(num_classes=1, encoder_name='resnet101', encoder_weights='imagenet'):
     """
-    Return a DeepLabV3 model from segmentation_models_pytorch.
+    Return a PSPNet from segmentation_models_pytorch with ResNet101 encoder.
     For binary segmentation, classes=1.
     """
-    model = smp.DeepLabV3(
+    model = smp.PSPNet(
         encoder_name=encoder_name,
         encoder_weights=encoder_weights,
         in_channels=3,
         classes=num_classes,
-        activation=None  # We'll do sigmoid in training/inference
+        activation=None  # We'll apply sigmoid in training/inference
     )
     return model
 
