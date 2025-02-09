@@ -5,34 +5,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# Mapping from classTitle in the JSON to channel index in the mask
-# Adjust or extend as needed.
-CLASS_MAP = {
-    "Iris": 0,
-    "Pupil": 1,
-    "Lens": 2
-}
-
-
-def polygons_to_mask(polygons, image_shape):
-    """
-    Convert a list of polygons (each is list of [x, y] points) into
-    a single binary mask of shape (H, W).
-    """
-    mask = np.zeros(image_shape[:2], dtype=np.uint8)
-    # polygons is expected to be a list of lists of [x, y]
-    # We must convert each polygon to int32 for cv2.fillPoly
-    pts = [np.array(polygons, dtype=np.int32)]
-    cv2.fillPoly(mask, pts, 1)
-    return mask
-
-
 class CataractDataset(Dataset):
     def __init__(self, samples, transform=None):
         """
-        Args:
-            samples (list): Each element is (img_path, ann_path).
-            transform (albumentations.Compose): Transform pipeline.
+        samples: list of (img_path, ann_path)
+        transform: Albumentations transform pipeline
         """
         self.samples = samples
         self.transform = transform
@@ -44,39 +21,31 @@ class CataractDataset(Dataset):
         img_path, ann_path = self.samples[idx]
 
         # Load image
-        image = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB
+        image_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
         # Load JSON annotation
         with open(ann_path, 'r') as f:
             ann_data = json.load(f)
 
-        # Prepare multi-channel mask
-        height, width = ann_data["size"]["height"], ann_data["size"]["width"]
-        num_classes = len(CLASS_MAP)  # 3: Iris, Pupil, Lens
-        mask = np.zeros((height, width, num_classes), dtype=np.uint8)
+        h, w = ann_data["size"]["height"], ann_data["size"]["width"]
+        mask = np.zeros((h, w), dtype=np.uint8)
 
+        # Fill polygon for "Cornea" only
         for obj in ann_data["objects"]:
-            class_title = obj["classTitle"]
-            if class_title not in CLASS_MAP:
-                # Skip classes not in CLASS_MAP (e.g., "Cornea" if not needed)
-                continue
+            if obj["classTitle"] == "Cornea":
+                pts = np.array(obj["points"]["exterior"], dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 1)
 
-            channel_idx = CLASS_MAP[class_title]
-            polygon_pts = obj["points"]["exterior"]
-            # Convert polygon to mask
-            polygon_mask = polygons_to_mask(polygon_pts, (height, width, 3))
-            mask[..., channel_idx] = np.maximum(mask[..., channel_idx], polygon_mask)
-
-        # Optional transforms (Albumentations expects dict with "image", "mask")
+        # Apply Albumentations transforms
         if self.transform is not None:
-            transformed = self.transform(image=image, mask=mask)
-            image = transformed["image"]
-            mask = transformed["mask"]
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"]
 
-        # Convert to tensors
-        # image: shape (C, H, W), mask: shape (num_classes, H, W)
-        image = torch.from_numpy(image.transpose(2, 0, 1)).float()  # [3, H, W]
-        mask = torch.from_numpy(mask.transpose(2, 0, 1)).float()  # [3, H, W]
+        # Convert to tensor
+        # image: [C, H, W], mask: [1, H, W]
+        image = torch.from_numpy(image.transpose(2, 0, 1)).float()
+        mask = torch.from_numpy(mask).unsqueeze(0).float()
 
         return image, mask
