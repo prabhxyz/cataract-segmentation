@@ -2,3 +2,6 @@
 
 # For local testing.
 /case_2000.mp4
+
+# The model (too big for Git).
+/models/model_epoch_150.pth
